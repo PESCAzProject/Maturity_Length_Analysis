@@ -1,0 +1,679 @@
+---
+title: "Maturity"
+author: "Javier Martinez Arribas, CIBIO-TropiBIO (javimartinezarribas@gmail.com)"
+date: "`r format(seq.Date( Sys.Date(), length=2, by='1 day' )[2], '%d %B %Y')`"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  pdf_document:
+    fig_caption: yes
+    fig_height: 5
+    fig_width: 8
+    highlight: tango
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Age-Length Keys
+
+As idades dos peixes são dados importantes para a compreensão
+a dinâmica das populações de peixes. Estimando a idade para um grande número de peixes,
+no entanto, é trabalhoso. Felizmente, geralmente há uma forte relação
+entre o comprimento e a idade, e medindo o comprimento de um grande número de peixes
+é relativamente fácil. 
+
+Assim, a estrutura etária para uma grande amostra de peixes pode ser
+estimado de forma confiável resumindo a relação entre idade e comprimento
+para uma subamostra de peixes e, em seguida, aplicar este resumo a toda a amostra.
+O resumo da relação entre idade e comprimento é uma chave de comprimento de idade
+(ALK).
+
+A tabela de probabilidades condicionais, $p{_{j|i}=\frac{n_{ij}}{n_i}}$ derivadas
+da amostra envelhecida é o ALK.
+
+No estudo seguinte tentaremos descobrir a relação entre a idade do peixe e um conjunto diferente de variáveis explicativas como o tamanho, o sexo ou o ano em que a amostra foi recolhida.
+Tentaremos conhecer esta relação através de vários tipos de modelos, tais como:
+
+- Modelo de Regressão Multinomial.
+- Modelo de Random Forest
+- Modelo de matriz ALK.
+
+Nosso primeiro passo será carregar as bibliotecas que vamos usar e depois vamos nos 
+conectar ao banco de dados para carregar os dados relacionados ao peso-tamanho do peixe.
+
+```{r, echo=T, message=F, warning=F, error=F}
+load.libraries <- c('DBI','tidyverse','tidymodels','modeltime','timetk','lubridate',
+                    'imputeTS','plm','tsibble','fable','FSA','missMethods','nnet',
+                    'effects','ranger','vip','tune','randomForest','NeuralNetTools',
+                    'mice')
+install.lib <- load.libraries[!load.libraries %in% installed.packages()]
+
+for(libs in install.lib) install.packages(libs, dependences = TRUE)
+sapply(load.libraries, require, character = TRUE)
+```
+
+e carregar os dados...
+
+```{r, echo=T, message=F, warning=F, error=F}
+dbicon <-  DBI::dbConnect(RPostgres::Postgres(),
+                          db = "PESCAz", 
+                          host = "localhost", 
+                          port = "5432", 
+                          user = "postgres",
+                          password = "1234")
+dbListTables(dbicon)
+
+sql <- 'SELECT * FROM "tblmaturity"'
+df_maturity <- dbGetQuery(dbicon, sql)
+
+
+dbDisconnect(dbicon)
+```
+
+Em seguida, selecionamos os preditores que vamos utilizar na análise e calculamos 
+o sexo e a idade na primeira maturação.
+
+
+```{r, echo=T, message=F, warning=F, error=F}
+maturity_tbl <- df_maturity %>%
+  select(Data, Ano, Mes, Trimestre, Matura, Sexo, MaturaH1, SexoH1, Complf) %>%
+  set_names(c("date", "ano", "mes", "trimestre", "matura", "sexo", "maturaH1",
+              "sexoH1", "comprimento")) 
+
+# Criando coluna de sexo reunindo o sexo da primeira matura para M,F ou hermafroditas
+maturity_tbl <- maturity_tbl %>% mutate(sexo = ifelse(sexoH1 %in% "", sexo, sexoH1))
+# Criando coluna de matura reunindo a matura da primeira matura para M,F ou hermafroditas
+maturity_tbl <- maturity_tbl %>% mutate(matura = ifelse(maturaH1 %in% "", 
+                                                       substr(matura,start=1,stop=1), 
+                                                       maturaH1))
+maturity_tbl$day <- gsub("(.*)[-]", "", maturity_tbl$date)
+
+maturity_tbl <- maturity_tbl %>%
+  select(date, ano, mes, trimestre, day, comprimento, sexo, matura)
+
+# Alterar alguns formatos
+maturity_tbl <- maturity_tbl %>% 
+                    mutate(ano = as.numeric(ano),
+                           day = as.numeric(day),
+                           mes = as.numeric(mes),
+                           trimestre = as.numeric(trimestre),
+                           matura = as.factor(matura))
+
+
+```
+
+Filtramos as observações com valores da variável sexo ('IND', 'H' e '') e 
+observações com comprimento=0 e matura vazia, uma vez que serão mais difíceis de 
+imputar.
+
+```{r, echo=T, message=F, warning=F, error=F}
+with(maturity_tbl[maturity_tbl$sexo %in% c('','IND','H'),], table(matura))
+maturity_tbl <- maturity_tbl %>% 
+                  filter(!sexo %in% c('IND','H',''))
+
+with(maturity_tbl[maturity_tbl$comprimento==0,], table(matura))
+maturity_tbl <- maturity_tbl %>% 
+                  filter(!(comprimento==0 & matura==''))
+
+
+maturity_tbl$matura[maturity_tbl$matura %in% c('I','')] <- NA
+
+# Descartamos os níveis que não são adequados no conjunto de dados:
+maturity_tbl$matura <- droplevels(maturity_tbl$matura)
+
+with(maturity_tbl[maturity_tbl$comprimento==0,], table(matura))
+```
+
+Criamos o preditor de intervalo.
+
+```{r, echo=T, message=F, warning=F, error=F}
+maturity_tbl <- maturity_tbl %>% mutate(lcat10=lencat(comprimento,w=10))
+```
+
+Separamos as observações com maduro=NA:
+
+```{r, echo=T, message=F, warning=F, error=F}
+maturity_pred <- maturity_tbl %>%
+                  rowid_to_column() %>%
+                  filter(is.na(matura))
+maturity_train <- maturity_tbl[-as.numeric(maturity_pred$rowid),]
+```
+Dividimos o conjunto de dados sem NAs atribuídos à variável madura em duas subamostras.
+Um será usado para ajuste e o outro para obter uma avaliação mais realista do ajuste.
+O método utilizado será a amostragem estratificada pela variável madura pois 
+parece que há muita diferença entre o número de registros em cada tipo de matura.
+ 
+75% train / 25% test
+
+```{r, echo=T, message=F, warning=F, error=F}
+data_split <- initial_split(maturity_train, 
+                            prop = 3/4, 
+                            strata = matura)
+train <- training(data_split) 
+test <- testing(data_split)
+
+train%>% select(matura) %>% table()
+test%>% select(matura) %>% table()
+```
+
+## Análise exploratória de dados
+
+Primeiramente vamos tentar conhecer um pouco melhor as distribuições de nossas 
+variáveis através dos gráficos a seguir.
+
+
+Comprimento ao longo dos anos por sexo:
+
+```{r, echo=T, fig.width=10,fig.height=5}
+ggplot(train, aes(x=ano, y=comprimento, col=sexo)) +
+  geom_point()
+```
+
+Comprimento por matura:
+
+```{r, echo=T, fig.width=10,fig.height=5}
+ggplot(train, aes(x=matura, y=comprimento, col=matura, group=matura)) +
+  geom_point()
+```
+
+
+Comprimento por sexo:
+
+```{r, echo=T, fig.width=10,fig.height=3}
+ggplot(train, aes(x=sexo, y=comprimento, color=sexo)) +
+  geom_boxplot()
+```
+
+Comprimento por sexo e matura
+
+```{r, echo=T, fig.width=10,fig.height=3}
+ggplot(train, aes(x=matura, y=comprimento, color=sexo)) +
+  geom_boxplot()
+```
+
+Comprimento médio por ano e sexo
+
+```{r, echo=T, fig.width=10,fig.height=4}
+ggplot(data = train, aes(x = ano, y = comprimento)) +
+  geom_line(aes(colour = as.factor(sexo))) +
+  geom_smooth(method = "lm", se = F, lty = "dashed") +
+  labs(x = "Ano",  y = "Comprimento") +
+  theme(legend.position = "none")
+```
+
+Heterogeneidade ao longo do tempo:
+
+```{r, echo=T, fig.width=10,fig.height=4}
+#Heterogeneity along the time
+train %>%
+  group_by(ano) %>%
+  summarise(comp_mean = mean(comprimento)) %>%
+  left_join(train,by="ano") %>%
+  ggplot(data = ., 
+         aes(x = ano, y = comprimento)) +
+  geom_point() +
+  geom_line(aes(x = ano, y = comp_mean), col = "blue") +
+  scale_x_continuous(labels = as.character(maturity_tbl$ano), 
+                     breaks = maturity_tbl$ano) +
+  labs(x = "Ano", y = "Comprimento") +
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+Distribuição da matura entre os sexos:
+
+```{r, echo=T, fig.width=10,fig.height=4}
+ggplot(data=train, aes(x=matura,  fill=sexo)) +
+  geom_bar(stat="count")
+```
+
+Distribuição do comprimento entre os sexos:
+
+```{r, echo=T, fig.width=10,fig.height=4}
+# comprimento by sexo distribution
+ggplot(data=train, aes(x=comprimento,  fill= sexo, color=sexo)) +
+  geom_histogram(position="identity",alpha=0.5)+
+  theme(legend.position="top")
+```
+
+Distribuição do número de observações ao longo do tempo e entre os dois sexos:
+
+```{r, echo=T, fig.width=10,fig.height=3}
+# Number obs along the time by sexo
+ggplot(data = train, aes(x = ano, fill = sexo)) + 
+  geom_bar(stat="count",alpha=0.5)
+```
+
+Distribuição dos intervalos entre os sexos:
+
+```{r, echo=T, fig.width=10,fig.height=3}
+# lcat10 distribution
+ggplot(data=train, aes(x=lcat10,  fill=sexo)) +
+  geom_bar(stat="count")
+```
+
+
+## Modeling
+
+Em seguida, vamos estudar 3 modelos diferentes de regressão multinomial:
+
+
+matura ~ lcat10 
+
+matura ~ lcat10 + sexo + lcat10*sexo
+
+matura ~ lcat10 + sexo + ano + lcat10:sexo + lcat10:ano + sexo:ano
+
+E veja se eles são significativamente diferentes um do outro:
+
+Imputamos los valores de comprimento=0 utilizando K-Nearest Neighbourhood = 3
+
+Fazemos validação cruzada para encontrar o melhor valor do hiperparâmetro de penalty:
+```{r, echo=T, message=F, warning=F, error=F}
+ml1_rec <-
+  recipe(matura ~  lcat10,
+         data = train) %>%
+  step_naomit(everything(), skip = TRUE)
+
+# K-fold cross-validation
+set.seed(1234)
+cv_folds <- vfold_cv(train, v = 10)
+
+ml_spec <- multinom_reg(
+    mode = "classification",
+    engine = "nnet",
+    penalty = tune(),
+    mixture = NULL
+)
+
+ml1_wflow <-
+  workflow() %>%
+  add_recipe(ml1_rec) %>% 
+  add_model(ml_spec) 
+
+random_tune1 <-
+  ml1_wflow %>%
+  tune_grid(
+    resamples = cv_folds, grid = 5
+  )
+
+
+random_final1 <-
+  finalize_workflow(ml1_wflow, select_best(random_tune1)) %>%
+  fit(train)
+
+last_fit_ml1 <- last_fit(random_final1, 
+                        split = data_split,
+                        metrics = metric_set(
+                        recall, precision,
+                        roc_auc, sens, spec)
+)
+
+
+last_fit_ml1 %>% 
+  collect_metrics()
+
+last_fit_ml1 %>%
+  collect_predictions() %>% 
+  conf_mat(matura, .pred_class) %>% 
+  autoplot(type = "heatmap")
+
+last_fit_ml1 %>% 
+  collect_predictions() %>% 
+  roc_curve(matura,'.pred_0','.pred_1','.pred_2','.pred_3','.pred_4','.pred_5') %>% 
+  autoplot()
+
+# Ajustamos o modelo final em todo o conjunto de dados.
+final_model1 <- 
+  random_final1 %>% 
+  fit(data = maturity_train)
+```
+
+O ajuste não é muito bom como podemos ver nas curvas ROC.
+
+Se calcularmos o expoente dos coeficientes, podemos ver como eles influenciam 
+os odds de matura:
+
+```{r, echo=T, message=F, warning=F, error=F}
+exp(coefficients(final_model1$fit$fit$fit))
+```
+
+Conclusões:
+
+Aumentar o valor do intervalo de comprimento um nível aumenta em 10% a probabilidade de 
+que a idade do peixe seja 4 em vez de 0
+
+
+Vejamos o que acontece quando adicionamos a variável sexo e suas iterações com 
+a variável interval lcat10:
+
+```{r, echo=T, message=F, warning=F, error=F}
+ml2_rec <-
+  recipe(matura ~  lcat10 + sexo,
+         data = train) %>%
+  step_naomit(everything(), skip = TRUE) %>% 
+  step_novel(sexo) %>%
+  step_interact(terms = ~ lcat10:sexo)
+
+# K-fold cross-validation
+set.seed(1234)
+cv_folds <- vfold_cv(train, v = 10)
+
+
+# ml_spec permanece o mesmo. Modelo de regressão multinomial
+
+ml2_wflow <-
+  workflow() %>%
+  add_recipe(ml2_rec) %>% 
+  add_model(ml_spec) 
+
+
+set.seed(100)
+random_tune2 <-
+  ml2_wflow %>%
+  tune_grid(
+    resamples = cv_folds, grid = 5
+  )
+
+random_final2 <-
+  finalize_workflow(ml2_wflow, select_best(random_tune2)) %>%
+  fit(train)
+
+last_fit_ml2 <- last_fit(random_final2, 
+                        split = data_split,
+                        metrics = metric_set(
+                        recall, precision,
+                        roc_auc, sens, spec)
+)
+
+
+last_fit_ml2 %>% 
+  collect_metrics()
+
+last_fit_ml2 %>%
+  collect_predictions() %>% 
+  conf_mat(matura, .pred_class) %>% 
+  autoplot(type = "heatmap")
+
+last_fit_ml2 %>% 
+  collect_predictions() %>% 
+  roc_curve(matura,'.pred_0','.pred_1','.pred_2','.pred_3','.pred_4','.pred_5') %>% 
+  autoplot()
+
+# Ajustamos o modelo final em todo o conjunto de dados.
+final_model2 <- 
+  random_final2 %>% 
+  fit(data = maturity_train)
+```
+
+O ajuste também não parece muito exato.
+
+Se calcularmos o expoente dos coeficientes, podemos ver como eles influenciam 
+os odds de matura:
+
+```{r, echo=T, message=F, warning=F, error=F}
+exp(coefficients(final_model2$fit$fit$fit))
+```
+
+Conclusões:
+
+Ao aumentar lcat10 um nível aumentará a probabilidade de ter um matura em 16%
+4 em vez de um 0 maduro.
+
+Parece que um matura 4 é 4 vezes mais provável de ocorrer em peixes do sexo
+M do que em peixes do sexo F.
+
+O aumento de lcat10 em um nível parece afetar a maturidade da mesma forma em ambos os sexos
+M como em F.
+
+Um teste de razão de verossimilhança para identificar uma diferença entre dois grupos
+requer o ajuste de dois modelos multinomiais. O primeiro modelo mais simples tem
+intervalo de comprimento como a única variável explicativa. O segundo modelo mais complexo tem intervalo de comprimento, a variável fator
+que identifica os grupos, e a interação entre essas duas variáveis como
+variáveis explicativas.
+
+
+```{r, echo=T, message=F, warning=F, error=F}
+anova(final_model1$fit$fit$fit,final_model2$fit$fit$fit)
+
+```
+
+
+Os dois modelos são estatisticamente diferentes, então a distribuição do
+tamanhos dentro de cada idade é diferente para cada sexo.
+
+Se agora adicionarmos o ano:
+
+Comprimento de primeira maturação por sexo e por ano bem como todas as iterações 
+de variáveis de dois por dois que podem ser obtidas:
+
+```{r, echo=T, message=F, warning=F, error=F}
+
+ml3_rec <-
+  recipe(matura ~  lcat10 + sexo + ano,
+         data = train) %>%
+  step_naomit(everything(), skip = TRUE) %>% 
+  step_novel(sexo) %>%
+  step_interact(~all_predictors() * all_predictors())
+
+
+# ml_spec permanece o mesmo. Modelo de regressão multinomial
+ml3_wflow <-
+  workflow() %>%
+  add_recipe(ml3_rec) %>% 
+  add_model(ml_spec) 
+
+random_tune3 <-
+  ml3_wflow %>%
+  tune_grid(
+    resamples = cv_folds, grid = 5
+  )
+
+random_final3 <-
+  finalize_workflow(ml3_wflow, select_best(random_tune3)) %>%
+  fit(train)
+
+last_fit_ml3 <- last_fit(random_final3, 
+                        split = data_split,
+                        metrics = metric_set(
+                        recall, precision,
+                        roc_auc, sens, spec)
+)
+
+last_fit_ml3 %>% 
+  collect_metrics()
+
+last_fit_ml3 %>%
+  collect_predictions() %>% 
+  conf_mat(matura, .pred_class) %>% 
+  autoplot(type = "heatmap")
+
+last_fit_ml3 %>% 
+  collect_predictions() %>% 
+  roc_curve(matura,'.pred_0','.pred_1','.pred_2','.pred_3','.pred_4','.pred_5') %>% 
+  autoplot()
+
+# Ajustamos o modelo final em todo o conjunto de dados ee estudamos os coeficientes:
+final_model3 <- 
+  random_final3 %>% 
+  fit(data = maturity_train)
+```
+
+
+```{r, echo=T, message=F, warning=F, error=F}
+exp(coefficients(final_model3$fit$fit$fit))
+```
+
+Conclusões:
+
+O ajuste melhora um pouco, talvez um pouco mais para peixes de maturidade 4.
+
+Parece que aumentando a variável ano em uma unidade, é 11% mais provável que matura 
+seja igual a 3 do que a 0.
+
+
+Um teste de razão de verossimilhança:
+
+```{r, echo=T, message=F, warning=F, error=F}
+anova(final_model2$fit$fit$fit,final_model3$fit$fit$fit)
+```
+
+O terceiro modelo é estatisticamente diferente do segundo, então podemos dizer
+que a distribuição de tamanhos dentro de cada idade e sexo é diferente ao longo
+os anos.
+
+Se finalmente compararmos os 3 modelos para ver qual deles tem um valor menor 
+para o critério de Akaike, veremos que:
+
+
+```{r, echo=T, message=F, warning=F, error=F}
+AIC(final_model1$fit$fit$fit,final_model2$fit$fit$fit,final_model3$fit$fit$fit)
+```
+
+Podemos afirmar que conseguimos um melhor ajuste com o terceiro modelo,
+inclua a variável ano e as iterações duas a duas entre todas as variáveis.
+
+Se calculássemos a maturação da subamostra com valores de NAs por meio da matriz ALK, 
+obteríamos as seguintes previsões:
+
+```{r, echo=T, message=F, warning=F, error=F}
+mALK <- round(prop.table(table(test$lcat10,test$matura),1),2)
+df_ALK <- data.frame(apply(mALK,1,function(row) colnames(mALK)[which.max(row)]))
+colnames(df_ALK) <- c('matura')
+df_ALK$matura <- as.factor(df_ALK$matura)
+df_ALK <- rownames_to_column(df_ALK, "lcat10")
+df_ALK$lcat10 <- as.numeric(df_ALK$lcat10)
+
+ALK_test <- left_join(test, df_ALK, by="lcat10")$matura.y
+
+df <- as.data.frame(cbind(predict(random_final1, test),predict(random_final2, test),
+                          predict(random_final3, test),
+                          ALK_test,test$matura))
+colnames(df) <- c("model_1","model_2","model_3","model_ALK","observed")
+
+table(df$model_1)
+table(df$model_2)
+table(df$model_3)
+table(df$model_ALK)
+table(df$observed)
+```
+
+
+Vamos ahora a probar um modelo Random Forest, e se conseguirmos um ajuste melhor 
+com ele, vamos usá-lo para predecir la submuestra con valores NAs en la variable matura.
+
+Construímos o modelo seguindo os mesmos passos do caso do modelo de 
+regressão multinomial:
+
+
+```{r, echo=T, message=F, warning=F, error=F}
+rf_rec <-
+  recipe(matura ~  comprimento + sexo + ano + mes + trimestre + day,
+        data = train) %>%
+        step_naomit(everything(), skip = TRUE) %>% 
+        step_novel(sexo) %>%
+        step_impute_knn(comprimento, neighbors = 3)
+        
+# K-fold cross-validation
+set.seed(1234)
+cv_folds <- vfold_cv(train, v = 10)        
+    
+rf_spec <-
+  rand_forest(
+    mode = "classification",
+    mtry = tune(),
+    trees = tune()
+  ) %>%
+  set_engine("randomForest")
+
+rf_wflow <-
+  workflow() %>%
+  add_recipe(rf_rec) %>% 
+  add_model(rf_spec) 
+  
+random_tune_rf <-
+  rf_wflow %>%
+  tune_grid(
+    resamples = cv_folds, grid = 5
+  )
+
+random_final_rf <-
+  finalize_workflow(rf_wflow, select_best(random_tune_rf)) %>%
+  fit(train)
+
+last_fit_rf <- last_fit(random_final_rf, 
+                        split = data_split,
+                        metrics = metric_set(
+                        recall, precision,
+                        roc_auc, sens, spec)
+)
+
+last_fit_rf %>% 
+  collect_metrics()
+
+last_fit_rf %>%
+  collect_predictions() %>% 
+  conf_mat(matura, .pred_class) %>% 
+  autoplot(type = "heatmap")
+
+last_fit_rf %>% 
+  collect_predictions() %>% 
+  roc_curve(matura,'.pred_0','.pred_1','.pred_2','.pred_3','.pred_4','.pred_5') %>% 
+  autoplot()
+
+```
+
+As curvas ROC nos mostram uma melhora significativa no ajuste de todas as maturas.
+
+
+Podemos também estudar a importância que o modelo dá a cada variável no ajuste:
+
+
+```{r, echo=T, message=F, warning=F, error=F}
+last_fit_rf %>% 
+  pluck(".workflow", 1) %>%   
+  extract_fit_parsnip() %>% 
+  vip(num_features = 10)
+```
+
+O comprimento, o dia e o ano de pesca parecem ser as variáveis que melhor 
+discriminam as maturas.
+
+
+## Predicting
+
+
+Finalmente, podemos fazer as previsões das amostras com NAs atribuídas na maturidade
+para poder reconstruir a série original
+
+
+```{r, echo=T, message=F, warning=F, error=F}
+
+pred <- random_final_rf %>% 
+          predict(maturity_pred) %>%
+          bind_cols(maturity_pred)
+
+maturity_pred <- maturity_pred %>%
+                  mutate(matura=pred$.pred_class)
+
+
+maturity_pred <- maturity_pred %>% select(-rowid)
+cc.fnl <- rbind(maturity_train,maturity_pred)
+
+cc.sumlen <- cc.fnl %>% group_by(matura) %>%
+  summarize(n_obs=validn(comprimento),mean_comprimento=mean(comprimento,na.rm=TRUE),
+            standard_deviation=sd(comprimento,na.rm=TRUE),standard_error=se(comprimento,na.rm=TRUE)) %>%
+  as.data.frame()
+cc.sumlen
+
+plot(comprimento~matura,data=cc.fnl,pch=19,col=rgb(0,0,0,1/10),
+     xlab="Age",ylab="Total Length (mm)",ylim=c(0,205))
+lines(mean_comprimento~matura,data=cc.sumlen,lwd=2,lty=2)
+```
+
+
+
+
