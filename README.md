@@ -1,4 +1,4 @@
 # Maturity-Length relation analysis
 Analysis of the relation between de age and the length of fishes
 
-https://pescazproject.github.io/Age_Length_Analysis/
+https://pescazproject.github.io/Maturity_Length_Analysis/
